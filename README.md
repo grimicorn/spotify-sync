@@ -77,7 +77,9 @@ launchctl bootout gui/$(id -u)/dev.grimicorn.spotify-sync
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.grimicorn.spotify-sync.plist
 ```
 
-Default interval is 900s. Nothing here is expensive, but the whole run is a handful of paged GETs plus the diff, so tightening below ~5 min mostly just burns rate limit.
+Default interval is 900s (15 min). Nothing here is expensive, but the whole run is a handful of paged GETs plus the diff, so tightening below ~5 min mostly just burns rate limit.
+
+If the repo lives on an external or network volume, point `StandardOutPath`/`StandardErrorPath` at a path on the internal disk (e.g. `~/Library/Logs/spotify-sync.log`). launchd will run the script from the external volume fine, but it can't create the log file there and fails the whole job with `EX_CONFIG` (exit 78) before Node even starts. Also note that while the volume is unmounted every tick fails and self-heals on remount, so nothing syncs until it's back. If your `node` comes from nvm rather than Homebrew, use its absolute path (`~/.nvm/versions/node/<version>/bin/node`) since launchd doesn't load nvm — and remember it breaks when you remove that node version.
 
 ## Safety
 
