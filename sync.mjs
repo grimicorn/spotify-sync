@@ -25,6 +25,12 @@ const sp = new Spotify({
 const MAIN = config.mainPlaylistId;
 if (!MAIN) throw new Error('config.json is missing mainPlaylistId');
 
+// The old `/me/tracks/contains` took 50 IDs, but the URI-based
+// `GET /me/library/contains` 400s ("Too many uris requested") on a batch of 50.
+// The limit is undocumented and shared with `PUT /me/library`, so stay
+// conservative until confirmed. Both endpoints take `uris` as a query param.
+const LIBRARY_URI_LIMIT = 20;
+
 /**
  * Feb 2026 renamed the playlist item wrapper from `track` to `item`.
  * Local files cannot be added to another playlist via the API, so they are
@@ -137,7 +143,7 @@ if (config.likeSongs !== false) {
   const tracks = desired.filter((uri) => uri.startsWith('spotify:track:'));
   const missing = [];
 
-  for (const batch of chunk(tracks, 50)) {
+  for (const batch of chunk(tracks, LIBRARY_URI_LIMIT)) {
     const res = await sp.request('GET', '/me/library/contains', {
       query: { uris: batch.join(',') },
     });
@@ -147,8 +153,8 @@ if (config.likeSongs !== false) {
     });
   }
 
-  for (const batch of chunk(missing, 50)) {
-    await sp.request('PUT', '/me/library', { body: { uris: batch } });
+  for (const batch of chunk(missing, LIBRARY_URI_LIMIT)) {
+    await sp.request('PUT', '/me/library', { query: { uris: batch.join(',') } });
   }
   saved = missing.length;
 }
