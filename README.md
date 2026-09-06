@@ -5,7 +5,12 @@ Rolls a set of genre playlists up into one main playlist, and saves everything i
 - Add a track to any genre playlist → it appears in the main playlist and in Liked Songs.
 - Remove it from the genre playlist → it disappears from the main playlist, and stays in Liked Songs.
 
-The main playlist is **derived**, not synced: every run recomputes it as `union(sources)`. Anything you drag straight into the main playlist gets deleted on the next run. Always add via a genre playlist.
+The main playlist is mostly **derived**: every run recomputes it as `union(sources)`. It also feeds two kinds of edit back to the sources:
+
+- **Remove a track from the main playlist** → it's removed from every genre playlist that held it (so it doesn't just reappear next run).
+- **Add a track to the main playlist** → it's added to the `Genre: Sort` playlist (`sortPlaylistId`), where you can later file it into a real genre.
+
+These two are detected by comparing the current main playlist against a snapshot of how the script last left it (`.main-snapshot.json`, git-ignored). The **first run** has no snapshot, so it skips propagation and just records the baseline. Any other direct edit to main that isn't one of the two above still gets reconciled away on the next run.
 
 Zero dependencies. Node 20+ (uses native `fetch`), no build step, no `npm install`.
 
@@ -31,6 +36,7 @@ cp config.example.json config.json
 | --------------------- | ------------------------------------------------------------------------------------------- |
 | `clientId`            | From the dashboard.                                                                          |
 | `mainPlaylistId`      | The derived playlist. Must be one you own.                                                   |
+| `sortPlaylistId`      | Where tracks added directly to the main playlist are routed. Must be one you own.             |
 | `sources.ids`         | Explicit list of genre playlist IDs.                                                         |
 | `sources.namePattern` | Regex against your own playlist names. Anything matching is treated as a source.              |
 | `likeSongs`           | `false` disables the Liked Songs half.                                                       |
@@ -100,6 +106,7 @@ Liked Songs is append-only by construction. The script calls `PUT /me/library` a
 - **Order** is preserved for tracks that stay. New tracks append to the end. Existing `added_at` values survive, because the script diffs instead of replacing wholesale.
 - **Unliking is not respected.** If you unlike a track that's still in a genre playlist, the next run re-likes it, because the script asks Spotify what's saved rather than keeping its own state. Remove it from the genre playlist first, or set `likeSongs: false`.
 - **Refresh tokens rotate** on PKCE. The client persists the new one on every refresh, so don't check `.tokens.json` into git or replace it with a stale copy.
+- **Main-edit propagation is snapshot-based.** `.main-snapshot.json` records main's non-local URIs as the script last left them. Deleting the snapshot forces a no-propagation bootstrap on the next run (a safe reset). Editing both a genre playlist and the main playlist between runs is fine; the snapshot only ever compares against main.
 
 ## API baseline
 

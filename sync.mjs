@@ -1,14 +1,21 @@
 #!/usr/bin/env node
 /**
- * Main playlist = union(source playlists). Recomputed every run, so adds and
- * removes both fall out of one idempotent diff. Liked Songs is append-only:
- * this script saves, it never unsaves.
+ * Main playlist = union(source playlists), plus two ways the main playlist
+ * feeds edits back to the sources:
+ *   - Remove a track from main  -> removed from every source that has it.
+ *   - Add a track to main       -> added to the "Genre: Sort" playlist.
+ * Both are detected by diffing the current main against a snapshot of main as
+ * this script last left it (`.main-snapshot.json`, git-ignored). The first run
+ * has no snapshot, so it skips propagation and just records the baseline.
+ *
+ * Liked Songs is append-only: this script saves, it never unsaves.
  *
  * Flags:
  *   --dry-run   print the plan, change nothing
  *   --force     bypass the mass-removal guard
  */
 import path from 'node:path';
+import { readFile, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { Spotify, readJson, chunk, log } from './spotify.mjs';
 
@@ -24,6 +31,36 @@ const sp = new Spotify({
 
 const MAIN = config.mainPlaylistId;
 if (!MAIN) throw new Error('config.json is missing mainPlaylistId');
+
+const SORT = config.sortPlaylistId;
+if (!SORT) throw new Error('config.json is missing sortPlaylistId');
+
+const SNAPSHOT_PATH = path.join(HERE, '.main-snapshot.json');
+
+// Returns null (not an empty set) on the first run, so callers can tell
+// "main was empty last time" from "we have never recorded main".
+async function readSnapshot() {
+  try {
+    const data = JSON.parse(await readFile(SNAPSHOT_PATH, 'utf8'));
+    return new Set(data.uris ?? []);
+  } catch (err) {
+    if (err.code === 'ENOENT') return null;
+    throw err;
+  }
+}
+
+async function writeSnapshot(uris) {
+  const data = { updatedAt: new Date().toISOString(), uris: [...uris] };
+  await writeFile(SNAPSHOT_PATH, JSON.stringify(data, null, 2) + '\n');
+}
+
+function union(sets) {
+  const out = new Set();
+  for (const set of sets) {
+    for (const uri of set) out.add(uri);
+  }
+  return out;
+}
 
 // The old `/me/tracks/contains` took 50 IDs, but the URI-based
 // `GET /me/library/contains` 400s ("Too many uris requested") on a batch of 50.
@@ -70,25 +107,66 @@ async function resolveSourceIds() {
 
 // ---- gather -----------------------------------------------------------------
 
+const prevMain = await readSnapshot();
+
 const sourceIds = await resolveSourceIds();
 if (sourceIds.length === 0) throw new Error('no source playlists resolved, refusing to run');
 
-const desired = [];
-const desiredSet = new Set();
+// Membership is kept per source as a mutable set, so propagating edits back to
+// the sources updates the union without another round of fetches.
+const membership = new Map();
 for (const id of sourceIds) {
   const uris = await playlistUris(id); // throws on failure, which aborts before any write
   log(`source ${id}: ${uris.length} items`);
-  for (const uri of uris) {
-    if (desiredSet.has(uri)) continue;
-    desiredSet.add(uri);
-    desired.push(uri);
+  membership.set(id, new Set(uris));
+}
+if (!membership.has(SORT)) membership.set(SORT, new Set());
+
+const mainUris = await playlistUris(MAIN);
+const mainSet = new Set(mainUris);
+
+// The union as the sources stand right now, before any main-driven edit. Used
+// to tell a genuine manual add to main from a track that is already in a source.
+const sourceUnion = union(membership.values());
+log(`main ${MAIN}: ${mainUris.length} items, union of sources: ${sourceUnion.size}`);
+
+// ---- propagate main edits back to sources -----------------------------------
+
+const removedFromMain = [];
+const addedToMain = [];
+
+if (prevMain) {
+  for (const uri of prevMain) {
+    if (!mainSet.has(uri)) removedFromMain.push(uri);
+  }
+  for (const uri of mainSet) {
+    if (!prevMain.has(uri) && !sourceUnion.has(uri)) addedToMain.push(uri);
+  }
+} else {
+  log('no snapshot found, bootstrapping without propagation');
+}
+
+// uri removed from main -> drop it from every source that still holds it.
+const sourceRemovals = new Map();
+for (const uri of removedFromMain) {
+  for (const [id, set] of membership) {
+    if (!set.has(uri)) continue;
+    set.delete(uri);
+    if (!sourceRemovals.has(id)) sourceRemovals.set(id, []);
+    sourceRemovals.get(id).push(uri);
   }
 }
 
-const mainUris = await playlistUris(MAIN);
-log(`main ${MAIN}: ${mainUris.length} items, union of sources: ${desired.length}`);
+// uri added to main -> route it into the Sort playlist.
+for (const uri of addedToMain) membership.get(SORT).add(uri);
+
+const removedCount = [...sourceRemovals.values()].reduce((n, uris) => n + uris.length, 0);
+log(`main edits: removed ${removedFromMain.length} (${removedCount} source deletions), added ${addedToMain.length} to sort`);
 
 // ---- diff -------------------------------------------------------------------
+
+const desiredSet = union(membership.values());
+const desired = [...desiredSet];
 
 const counts = new Map();
 for (const uri of mainUris) counts.set(uri, (counts.get(uri) ?? 0) + 1);
@@ -118,6 +196,10 @@ if (!FORCE && toRemove.length >= minRemovals && ratio > maxRatio) {
 }
 
 if (DRY_RUN) {
+  for (const [id, uris] of sourceRemovals) {
+    for (const uri of uris) console.log(`  source ${id} - ${uri}`);
+  }
+  for (const uri of addedToMain) console.log(`  sort ${SORT} + ${uri}`);
   for (const uri of toAdd) console.log(`  + ${uri}`);
   for (const uri of toRemove) console.log(`  - ${uri}`);
   log('dry run, no changes made');
@@ -125,6 +207,20 @@ if (DRY_RUN) {
 }
 
 // ---- apply ------------------------------------------------------------------
+
+// Propagate main-driven edits to the sources first, then reconcile main to the
+// resulting union.
+for (const [id, uris] of sourceRemovals) {
+  for (const batch of chunk(uris, 100)) {
+    await sp.request('DELETE', `/playlists/${id}/items`, {
+      body: { items: batch.map((uri) => ({ uri })) },
+    });
+  }
+}
+
+for (const batch of chunk(addedToMain, 100)) {
+  await sp.request('POST', `/playlists/${SORT}/items`, { body: { uris: batch } });
+}
 
 for (const batch of chunk(toRemove, 100)) {
   await sp.request('DELETE', `/playlists/${MAIN}/items`, {
@@ -158,5 +254,9 @@ if (config.likeSongs !== false) {
   }
   saved = missing.length;
 }
+
+// Snapshot main as we just left it: the union is exactly its non-local content.
+// Next run diffs the then-current main against this to spot manual edits.
+await writeSnapshot(desiredSet);
 
 log(`done: added ${toAdd.length}, removed ${toRemove.length}, newly liked ${saved}`);

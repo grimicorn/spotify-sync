@@ -1,6 +1,7 @@
 {
   "clientId": "PASTE_CLIENT_ID_FROM_SPOTIFY_DASHBOARD",
   "mainPlaylistId": "PASTE_MAIN_PLAYLIST_ID",
+  "sortPlaylistId": "PASTE_SORT_PLAYLIST_ID",
   "sources": {
     "ids": [],
     "namePattern": "^Genre: "
